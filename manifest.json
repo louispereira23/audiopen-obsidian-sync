@@ -1,0 +1,10 @@
+{
+  "id": "audiopen",
+  "name": "AudioPen",
+  "version": "0.2.0",
+  "minAppVersion": "1.13.0",
+  "description": "Sync your AudioPen voice notes into your vault as Markdown files.",
+  "author": "AudioPen",
+  "authorUrl": "https://audiopen.ai",
+  "isDesktopOnly": false
+}
