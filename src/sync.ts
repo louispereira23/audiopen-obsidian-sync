@@ -1,7 +1,10 @@
 import { type App, TFile, TFolder, normalizePath } from "obsidian";
 import type { AudioPenApi, SyncNote } from "./api.ts";
 import {
+  UNCATEGORIZED_FOLDER,
+  cleanRoot,
   contentHash,
+  folderName,
   notePath,
   renderNote,
   withNumberSuffix,
@@ -20,11 +23,17 @@ export type TrackedNote = {
    *  and the plugin leaves it there. Defaults to `path` when missing.
    */
   autoPath?: string;
+  /** The note had no AudioPen folder when last synced. When missing, a file
+   *  sitting directly in the root folder counts as unfiled.
+   */
+  unfiled?: boolean;
 };
 
 export type SyncState = {
   /** Server `until` of the last completed sync; null before the first one. */
   lastSyncedUntil: number | null;
+  /** Whether unfiled notes were last placed in the Uncategorized folder. */
+  useUncategorized?: boolean;
   notes: Record<string, TrackedNote>;
 };
 
@@ -78,6 +87,8 @@ export class SyncEngine {
   private readonly persist: () => Promise<void>;
   /** path → id of the note tracked there. */
   private owners = new Map<string, string>();
+  /** Unfiled notes go in root/Uncategorized once the user has any folder. */
+  private useUncategorized = false;
 
   constructor(
     app: App,
@@ -100,6 +111,11 @@ export class SyncEngine {
     this.owners.clear();
     for (const [id, tracked] of Object.entries(this.state.notes)) this.owners.set(tracked.path, id);
 
+    // Creating or deleting a folder doesn't change any note, so the folder
+    // list is checked on every sync.
+    const library = await this.api.library(this.token);
+    this.useUncategorized = library.folders.some((folder) => !folder.Universal);
+
     const since = this.options.full ? null : this.state.lastSyncedUntil;
     let until: number | null = null;
     let afterId = 0;
@@ -119,6 +135,10 @@ export class SyncEngine {
       await this.persist();
     }
 
+    if ((this.state.useUncategorized ?? false) !== this.useUncategorized) {
+      await this.moveUnfiledNotes();
+    }
+    this.state.useUncategorized = this.useUncategorized;
     this.state.lastSyncedUntil = until;
     await this.persist();
     return result;
@@ -129,13 +149,14 @@ export class SyncEngine {
     const tracked = this.state.notes[key];
     const content = renderNote(note, this.options);
     const hash = contentHash(content);
-    const desired = normalizePath(notePath(this.options.folder, note));
+    const desired = normalizePath(notePath(this.options.folder, note, this.useUncategorized));
+    const unfiled = folderName(note) === null;
 
     const file = tracked ? this.fileAt(tracked.path) : null;
     if (tracked && file) {
       const current = await this.app.vault.read(file);
       if (current === content) {
-        this.track(key, file.path, hash, tracked.autoPath ?? tracked.path);
+        this.track(key, file.path, hash, tracked.autoPath ?? tracked.path, unfiled);
         return;
       }
       if (contentHash(current) !== tracked.hash) {
@@ -150,9 +171,9 @@ export class SyncEngine {
       if (file.path === autoPath && file.path !== desired) {
         const target = await this.renameTarget(desired, file.path);
         if (target !== file.path) await this.app.fileManager.renameFile(file, target);
-        this.track(key, target, hash, target);
+        this.track(key, target, hash, target, unfiled);
       } else {
-        this.track(key, file.path, hash, autoPath);
+        this.track(key, file.path, hash, autoPath, unfiled);
       }
       result.updated++;
       return;
@@ -162,7 +183,31 @@ export class SyncEngine {
       result.skippedDeleted++;
       return;
     }
-    await this.place(key, desired, content, hash, result);
+    await this.place(key, desired, content, hash, unfiled, result);
+  }
+
+  /** After the user creates their first AudioPen folder or deletes their
+   *  last one, moves unfiled notes between the root folder and
+   *  root/Uncategorized. Only files still where the plugin put them move;
+   *  edited files move too, since moving doesn't touch their content.
+   */
+  private async moveUnfiledNotes(): Promise<void> {
+    const root = normalizePath(cleanRoot(this.options.folder));
+    const uncategorized = normalizePath(`${root}/${UNCATEGORIZED_FOLDER}`);
+    const [from, to] = this.useUncategorized ? [root, uncategorized] : [uncategorized, root];
+
+    for (const [key, tracked] of Object.entries(this.state.notes)) {
+      const autoPath = tracked.autoPath ?? tracked.path;
+      const unfiled = tracked.unfiled ?? parentOf(autoPath) === root;
+      if (!unfiled || tracked.path !== autoPath || parentOf(autoPath) !== from) continue;
+      const file = this.fileAt(tracked.path);
+      if (!file) continue;
+
+      const fileName = file.path.split("/").pop() ?? file.path;
+      const target = await this.renameTarget(normalizePath(`${to}/${fileName}`), file.path);
+      if (target !== file.path) await this.app.fileManager.renameFile(file, target);
+      this.track(key, target, tracked.hash, target, true);
+    }
   }
 
   /** Puts a note that has no file yet at `desired`, or `desired (2)`,
@@ -176,6 +221,7 @@ export class SyncEngine {
     desired: string,
     content: string,
     hash: string,
+    unfiled: boolean,
     result: SyncResult,
   ): Promise<void> {
     for (let n = 1; n <= MAX_NAME_SUFFIX; n++) {
@@ -184,13 +230,13 @@ export class SyncEngine {
       if (!existing) {
         await this.ensureFolder(parentOf(path));
         await this.app.vault.create(path, content);
-        this.track(key, path, hash, path);
+        this.track(key, path, hash, path, unfiled);
         result.created++;
         return;
       }
       if (this.owners.has(path) || !(existing instanceof TFile)) continue;
       if ((await this.app.vault.read(existing)) === content) {
-        this.track(key, path, hash, path);
+        this.track(key, path, hash, path, unfiled);
         return;
       }
       result.skippedEdited.push(path);
@@ -214,9 +260,9 @@ export class SyncEngine {
     return currentPath;
   }
 
-  private track(key: string, path: string, hash: string, autoPath: string): void {
+  private track(key: string, path: string, hash: string, autoPath: string, unfiled: boolean): void {
     this.untrack(key);
-    this.state.notes[key] = { path, hash, autoPath };
+    this.state.notes[key] = { path, hash, autoPath, unfiled };
     this.owners.set(path, key);
   }
 

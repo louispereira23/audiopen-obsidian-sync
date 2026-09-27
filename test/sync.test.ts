@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { ChangesPage, ChangesQuery, SyncNote } from "../src/api.ts";
+import type { ChangesPage, ChangesQuery, Library, SyncNote } from "../src/api.ts";
 import { TFile, TFolder } from "./obsidian-stub.ts";
 import { SyncEngine, emptyState, followRename } from "../src/sync.ts";
 
@@ -65,8 +65,13 @@ function fakeApp(vault: FakeVault) {
 class FakeApi {
   calls: ChangesQuery[] = [];
   pages: Omit<ChangesPage, "until">[];
-  constructor(pages: Omit<ChangesPage, "until">[]) {
+  folders: Library["folders"];
+  constructor(pages: Omit<ChangesPage, "until">[], folders: Library["folders"]) {
     this.pages = pages;
+    this.folders = folders;
+  }
+  async library(): Promise<Library> {
+    return { folders: this.folders };
   }
   async changes(_token: string, query: ChangesQuery): Promise<ChangesPage> {
     this.calls.push(query);
@@ -95,8 +100,14 @@ function page(notes: SyncNote[], extra: Partial<ChangesPage> = {}) {
   return { notes, deleted_note_ids: [], next_after_id: notes.at(-1)?.id ?? 0, has_more: false, ...extra };
 }
 
-async function runSync(vault: FakeVault, state: ReturnType<typeof emptyState>, pages: ReturnType<typeof page>[], full = false) {
-  const api = new FakeApi(pages);
+async function runSync(
+  vault: FakeVault,
+  state: ReturnType<typeof emptyState>,
+  pages: ReturnType<typeof page>[],
+  full = false,
+  folders: Library["folders"] = [],
+) {
+  const api = new FakeApi(pages, folders);
   const engine = new SyncEngine(
     fakeApp(vault) as never,
     api as never,
@@ -235,4 +246,66 @@ test("after plugin data is lost, unchanged files are adopted and edited ones are
   assert.equal(fresh.notes["1"].path, "AudioPen/Idea.md");
   assert.equal(vault.content("AudioPen/Plan.md"), "my rewrite");
   assert.deepEqual(result.skippedEdited, ["AudioPen/Plan.md"]);
+});
+
+const WORK = { id: 5, name: "Work", Universal: false };
+const ALL_NOTES = { id: 1, name: "All Notes", Universal: true };
+const inWork = { folders_note_mapping: WORK };
+
+test("unfiled notes stay in the root folder while the user has no folders", async () => {
+  const vault = new FakeVault();
+  await runSync(vault, emptyState(), [page([note(1, "Idea")])], false, [ALL_NOTES]);
+  assert.ok(vault.content("AudioPen/Idea.md"));
+});
+
+test("unfiled notes go in Uncategorized once the user has a folder", async () => {
+  const vault = new FakeVault();
+  await runSync(vault, emptyState(), [page([note(1, "Idea"), note(2, "Plan", inWork)])], false, [ALL_NOTES, WORK]);
+  assert.ok(vault.content("AudioPen/Uncategorized/Idea.md"));
+  assert.ok(vault.content("AudioPen/Work/Plan.md"));
+});
+
+test("the first folder moves existing unfiled notes, keeping edits and user moves", async () => {
+  const vault = new FakeVault();
+  const state = emptyState();
+  await runSync(vault, state, [page([note(1, "Idea"), note(2, "Draft"), note(3, "Kept"), note(4, "Plan", inWork)])]);
+  vault.userEdit("AudioPen/Draft.md", "my rewrite");
+  vault.folders.add("Projects");
+  vault.userMove("AudioPen/Kept.md", "Projects/Kept.md");
+  followRename(state, "AudioPen/Kept.md", "Projects/Kept.md");
+
+  // No note changed; the user just created a folder in AudioPen.
+  await runSync(vault, state, [page([])], false, [WORK]);
+  assert.ok(vault.content("AudioPen/Uncategorized/Idea.md"));
+  assert.equal(vault.content("AudioPen/Uncategorized/Draft.md"), "my rewrite");
+  assert.ok(vault.content("Projects/Kept.md"));
+  assert.ok(vault.content("AudioPen/Work/Plan.md"));
+  assert.equal(vault.content("AudioPen/Idea.md"), undefined);
+
+  // Edits made after the move are still recognised as edits.
+  vault.userEdit("AudioPen/Uncategorized/Idea.md", "edited later");
+  const { result } = await runSync(vault, state, [page([note(1, "Idea", { body: "v2" })])], false, [WORK]);
+  assert.deepEqual(result.skippedEdited, ["AudioPen/Uncategorized/Idea.md"]);
+});
+
+test("deleting the last folder moves unfiled notes back to the root folder", async () => {
+  const vault = new FakeVault();
+  const state = emptyState();
+  await runSync(vault, state, [page([note(1, "Idea"), note(2, "Plan", inWork)])], false, [WORK]);
+  await runSync(vault, state, [page([])], false, []);
+  assert.ok(vault.content("AudioPen/Idea.md"));
+  assert.equal(vault.content("AudioPen/Uncategorized/Idea.md"), undefined);
+  assert.ok(vault.content("AudioPen/Work/Plan.md"));
+});
+
+test("state saved before unfiled tracking still moves root notes", async () => {
+  const vault = new FakeVault();
+  const state = emptyState();
+  await runSync(vault, state, [page([note(1, "Idea"), note(2, "Plan", inWork)])]);
+  delete state.useUncategorized;
+  for (const tracked of Object.values(state.notes)) delete tracked.unfiled;
+
+  await runSync(vault, state, [page([])], false, [WORK]);
+  assert.ok(vault.content("AudioPen/Uncategorized/Idea.md"));
+  assert.ok(vault.content("AudioPen/Work/Plan.md"));
 });

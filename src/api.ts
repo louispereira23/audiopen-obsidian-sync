@@ -3,6 +3,7 @@ import { requestUrl } from "obsidian";
 /** Thin client for the AudioPen (Xano) endpoints this plugin uses:
  *  - the OTP login endpoints (email → one-time code → token)
  *  - `mcp/me` to check the plan at connect time
+ *  - `mcp/library` for the user's folder list
  *  - the read-only `sync/changes` feed
  * Nothing here can write to AudioPen data.
  */
@@ -39,6 +40,10 @@ export type SyncNote = {
   pinned: boolean | null;
   note_tag_association: { tag: SyncTag | null }[] | null;
   folders_note_mapping: { id: number; name: string; Universal: boolean | null } | null;
+};
+
+export type Library = {
+  folders: { id: number; name: string; Universal: boolean | null }[];
 };
 
 export type ChangesPage = {
@@ -78,6 +83,10 @@ export class AudioPenApi {
 
   me(token: string): Promise<Me> {
     return this.call<Me>("GET", `${MCP_BASE}/me`, token);
+  }
+
+  library(token: string): Promise<Library> {
+    return this.call<Library>("GET", `${MCP_BASE}/library`, token);
   }
 
   changes(token: string, query: ChangesQuery): Promise<ChangesPage> {

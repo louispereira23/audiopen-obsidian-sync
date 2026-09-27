@@ -40,11 +40,19 @@ export function renderNote(note: SyncNote, options: RenderOptions): string {
   return parts.filter((part) => part.length > 0).join("\n\n") + "\n";
 }
 
-/** Vault-relative path the note should live at, before collision handling. */
-export function notePath(root: string, note: SyncNote): string {
+/** Where notes without an AudioPen folder go once the user has folders. */
+export const UNCATEGORIZED_FOLDER = "Uncategorized";
+
+/** Vault-relative path the note should live at, before collision handling.
+ *  Notes without a folder sit directly under `root`, or under
+ *  `root/Uncategorized` when `useUncategorized` is set (the user has at least
+ *  one AudioPen folder).
+ */
+export function notePath(root: string, note: SyncNote, useUncategorized = false): string {
   const folder = folderName(note);
   const segments = [cleanRoot(root)];
   if (folder) segments.push(safeFileName(folder) || "Folder");
+  else if (useUncategorized) segments.push(UNCATEGORIZED_FOLDER);
   segments.push(`${safeFileName(displayTitle(note)) || "Untitled"}.md`);
   return segments.filter((segment) => segment.length > 0).join("/");
 }
