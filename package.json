@@ -1,6 +1,6 @@
 {
   "name": "audiopen-obsidian-sync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Sync your AudioPen voice notes into your Obsidian vault.",
   "main": "main.js",
   "private": true,
