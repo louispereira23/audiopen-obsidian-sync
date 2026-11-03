@@ -141,11 +141,14 @@ export default class AudioPenSyncPlugin extends Plugin {
       );
       const result = await engine.run();
       const summary = describe(result);
+      // A background sync speaks up about a failed note once, not every few minutes.
+      const newFailure = result.failed.length > 0 && summary !== this.data.lastSync?.summary;
       this.data.lastSync = { at: Date.now(), summary };
       await this.savePluginData();
 
-      const changed = result.created + result.updated + result.skippedEdited.length > 0;
-      if (!quiet || changed) new Notice(`AudioPen: ${summary}`, result.skippedEdited.length ? 10000 : 5000);
+      const changed = result.created + result.updated + result.skippedEdited.length > 0 || newFailure;
+      const long = result.skippedEdited.length > 0 || result.failed.length > 0;
+      if (!quiet || changed) new Notice(`AudioPen: ${summary}`, long ? 10000 : 5000);
     } catch (error) {
       if (error instanceof AuthExpiredError) await this.logOut();
       if (!quiet || error instanceof AuthExpiredError || error instanceof PrimeRequiredError) {
@@ -208,6 +211,12 @@ function describe(result: SyncResult): string {
   }
   if (result.skippedDeleted) {
     parts.push(`${result.skippedDeleted} not restored because you deleted them here (use Full re-sync)`);
+  }
+  if (result.failed.length) {
+    parts.push(
+      `${result.failed.length} couldn't be saved ("${result.failed[0]}"${result.failed.length > 1 ? " and others" : ""}) ` +
+        "and will be tried again next sync",
+    );
   }
   return parts.length > 0 ? parts.join(", ") + "." : "everything is up to date.";
 }

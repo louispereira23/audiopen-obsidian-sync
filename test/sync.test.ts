@@ -4,20 +4,43 @@ import type { ChangesPage, ChangesQuery, Library, SyncNote } from "../src/api.ts
 import { TFile, TFolder } from "./obsidian-stub.ts";
 import { SyncEngine, emptyState, followRename } from "../src/sync.ts";
 
+/** Behaves like a vault on Windows or macOS: names that differ only in
+ *  capitals are the same file, and Obsidian's create refuses them with the
+ *  same errors the real app throws.
+ */
 class FakeVault {
   files = new Map<string, { file: TFile; content: string }>();
   folders = new Set<string>();
+  /** Paths whose create fails, standing in for a file the vault won't take. */
+  failing = new Set<string>();
 
   getAbstractFileByPath(path: string) {
     if (this.files.has(path)) return this.files.get(path)!.file;
     if (this.folders.has(path)) return new TFolder(path);
     return null;
   }
+  getRoot() {
+    const root = new TFolder("/");
+    const folders = new Map<string, TFolder>([["", root]]);
+    const parentOf = (path: string) => folders.get(path.split("/").slice(0, -1).join("/")) ?? root;
+    for (const path of [...this.folders].sort((a, b) => a.split("/").length - b.split("/").length)) {
+      const folder = new TFolder(path);
+      folders.set(path, folder);
+      parentOf(path).children.push(folder);
+    }
+    for (const { file } of this.files.values()) parentOf(file.path).children.push(file);
+    return root;
+  }
   getMarkdownFiles() {
     return [...this.files.values()].map((entry) => entry.file);
   }
+  takenIgnoringCase(path: string) {
+    const lower = path.toLowerCase();
+    return [...this.files.keys(), ...this.folders].some((taken) => taken.toLowerCase() === lower);
+  }
   async create(path: string, content: string) {
-    assert.ok(!this.files.has(path), `create over existing ${path}`);
+    if (this.failing.has(path)) throw new Error("EPERM: operation not permitted");
+    if (this.takenIgnoringCase(path)) throw new Error("File already exists.");
     const parent = path.split("/").slice(0, -1).join("/");
     assert.ok(!parent || this.folders.has(parent), `missing folder ${parent}`);
     const file = new TFile(path);
@@ -25,6 +48,7 @@ class FakeVault {
     return file;
   }
   async createFolder(path: string) {
+    if (this.takenIgnoringCase(path)) throw new Error("Folder already exists.");
     this.folders.add(path);
   }
   async read(file: TFile) {
@@ -56,6 +80,9 @@ function fakeApp(vault: FakeVault) {
     vault,
     fileManager: {
       async renameFile(file: TFile, to: string) {
+        if (file.path.toLowerCase() !== to.toLowerCase() && vault.takenIgnoringCase(to)) {
+          throw new Error("Destination file already exists!");
+        }
         vault.userMove(file.path, to);
       },
     },
@@ -246,6 +273,76 @@ test("after plugin data is lost, unchanged files are adopted and edited ones are
   assert.equal(fresh.notes["1"].path, "AudioPen/Idea.md");
   assert.equal(vault.content("AudioPen/Plan.md"), "my rewrite");
   assert.deepEqual(result.skippedEdited, ["AudioPen/Plan.md"]);
+});
+
+test("titles that differ only in capitals get numbered names", async () => {
+  const vault = new FakeVault();
+  const state = emptyState();
+  const { result } = await runSync(vault, state, [
+    page([note(1, "Meeting notes"), note(2, "Meeting Notes"), note(3, "Later note")]),
+  ]);
+  assert.equal(result.created, 3);
+  assert.deepEqual([...vault.files.keys()].sort(), [
+    "AudioPen/Later note.md",
+    "AudioPen/Meeting Notes (2).md",
+    "AudioPen/Meeting notes.md",
+  ]);
+
+  // Deleting the folder and running a full re-sync brings both back.
+  for (const path of [...vault.files.keys()]) vault.userDelete(path);
+  const full = await runSync(vault, state, [
+    page([note(1, "Meeting notes"), note(2, "Meeting Notes"), note(3, "Later note")]),
+  ], true);
+  assert.equal(full.result.created, 3);
+  assert.deepEqual(full.result.failed, []);
+});
+
+test("AudioPen folders that differ only in capitals share one folder", async () => {
+  const vault = new FakeVault();
+  const ideas = { folders_note_mapping: { id: 5, name: "Ideas", Universal: false } };
+  const lowerIdeas = { folders_note_mapping: { id: 6, name: "ideas", Universal: false } };
+  await runSync(vault, emptyState(), [page([note(1, "Plan", ideas), note(2, "Plan", lowerIdeas)])]);
+  assert.deepEqual([...vault.files.keys()].sort(), ["AudioPen/Ideas/Plan (2).md", "AudioPen/Ideas/Plan.md"]);
+});
+
+test("a title that changes only in capitals renames the file, not to a numbered name", async () => {
+  const vault = new FakeVault();
+  const state = emptyState();
+  await runSync(vault, state, [page([note(1, "meeting notes")])]);
+  const { result } = await runSync(vault, state, [page([note(1, "Meeting Notes", { body: "v2" })])]);
+  assert.equal(result.updated, 1);
+  assert.deepEqual([...vault.files.keys()], ["AudioPen/Meeting Notes.md"]);
+  assert.match(vault.content("AudioPen/Meeting Notes.md")!, /v2/);
+});
+
+test("a note the vault won't take doesn't hold back the notes after it", async () => {
+  const vault = new FakeVault();
+  const state = emptyState();
+  vault.failing.add("AudioPen/Stuck.md");
+  const first = await runSync(vault, state, [page([note(1, "Idea"), note(2, "Stuck"), note(3, "Newest")])]);
+  assert.equal(first.result.created, 2);
+  assert.deepEqual(first.result.failed, ["Stuck"]);
+  assert.ok(vault.content("AudioPen/Newest.md"));
+  // The bookmark doesn't move past a failed note, so the next sync asks again.
+  assert.equal(state.lastSyncedUntil, null);
+
+  vault.failing.clear();
+  const second = await runSync(vault, state, [page([note(1, "Idea"), note(2, "Stuck"), note(3, "Newest")])]);
+  assert.equal(second.api.calls[0].since, null);
+  assert.equal(second.result.created, 1);
+  assert.deepEqual(second.result.failed, []);
+  assert.equal(state.lastSyncedUntil, 1_000);
+});
+
+test("an incremental sync with a failed note keeps its bookmark", async () => {
+  const vault = new FakeVault();
+  const state = emptyState();
+  await runSync(vault, state, [page([note(1, "Idea")])]);
+  state.lastSyncedUntil = 500;
+  vault.failing.add("AudioPen/Stuck.md");
+  const { result } = await runSync(vault, state, [page([note(2, "Stuck")])]);
+  assert.deepEqual(result.failed, ["Stuck"]);
+  assert.equal(state.lastSyncedUntil, 500);
 });
 
 const WORK = { id: 5, name: "Work", Universal: false };
