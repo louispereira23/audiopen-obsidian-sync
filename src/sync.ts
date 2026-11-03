@@ -1,9 +1,10 @@
-import { type App, TFile, TFolder, normalizePath } from "obsidian";
+import { type App, type TAbstractFile, TFile, TFolder, normalizePath } from "obsidian";
 import type { AudioPenApi, SyncNote } from "./api.ts";
 import {
   UNCATEGORIZED_FOLDER,
   cleanRoot,
   contentHash,
+  displayTitle,
   folderName,
   notePath,
   renderNote,
@@ -50,6 +51,8 @@ export type SyncResult = {
   skippedEdited: string[];
   /** Notes whose file was deleted in Obsidian (restored only by a full re-sync). */
   skippedDeleted: number;
+  /** Titles of notes the vault refused to save; the next sync tries them again. */
+  failed: string[];
 };
 
 const PAGE_SIZE = 50;
@@ -107,7 +110,7 @@ export class SyncEngine {
   }
 
   async run(): Promise<SyncResult> {
-    const result: SyncResult = { created: 0, updated: 0, skippedEdited: [], skippedDeleted: 0 };
+    const result: SyncResult = { created: 0, updated: 0, skippedEdited: [], skippedDeleted: 0, failed: [] };
     this.owners.clear();
     for (const [id, tracked] of Object.entries(this.state.notes)) this.owners.set(tracked.path, id);
 
@@ -125,7 +128,13 @@ export class SyncEngine {
       const page = await this.api.changes(this.token, { since, until, afterId, perPage: PAGE_SIZE });
       until = page.until;
       for (const note of page.notes) {
-        await this.applyNote(note, result);
+        // One note the vault won't take must not hold back every note after it.
+        try {
+          await this.applyNote(note, result);
+        } catch (error) {
+          console.error(`AudioPen: couldn't save note ${note.id}`, error);
+          result.failed.push(displayTitle(note));
+        }
       }
       // Notes deleted in AudioPen keep their Obsidian file; the plugin just
       // stops tracking them.
@@ -139,7 +148,9 @@ export class SyncEngine {
       await this.moveUnfiledNotes();
     }
     this.state.useUncategorized = this.useUncategorized;
-    this.state.lastSyncedUntil = until;
+    // After a failure the next sync starts where this one did, so it fetches
+    // the failed note again instead of moving past it for good.
+    this.state.lastSyncedUntil = result.failed.length > 0 ? since : until;
     await this.persist();
     return result;
   }
@@ -149,7 +160,7 @@ export class SyncEngine {
     const tracked = this.state.notes[key];
     const content = renderNote(note, this.options);
     const hash = contentHash(content);
-    const desired = normalizePath(notePath(this.options.folder, note, this.useUncategorized));
+    const desired = this.inVaultCase(normalizePath(notePath(this.options.folder, note, this.useUncategorized)));
     const unfiled = folderName(note) === null;
 
     const file = tracked ? this.fileAt(tracked.path) : null;
@@ -164,16 +175,17 @@ export class SyncEngine {
         return;
       }
       await this.app.vault.modify(file, content);
+      const autoPath = tracked.autoPath ?? tracked.path;
+      // Record the new content before any rename, so a rename that fails
+      // can't make the next sync take this file for one the user edited.
+      this.track(key, file.path, hash, autoPath, unfiled);
 
       // Follow AudioPen title / folder changes, but only if the file is still
       // where the plugin put it. A file the user moved stays where they put it.
-      const autoPath = tracked.autoPath ?? tracked.path;
       if (file.path === autoPath && file.path !== desired) {
         const target = await this.renameTarget(desired, file.path);
         if (target !== file.path) await this.app.fileManager.renameFile(file, target);
         this.track(key, target, hash, target, unfiled);
-      } else {
-        this.track(key, file.path, hash, autoPath, unfiled);
       }
       result.updated++;
       return;
@@ -192,8 +204,8 @@ export class SyncEngine {
    *  edited files move too, since moving doesn't touch their content.
    */
   private async moveUnfiledNotes(): Promise<void> {
-    const root = normalizePath(cleanRoot(this.options.folder));
-    const uncategorized = normalizePath(`${root}/${UNCATEGORIZED_FOLDER}`);
+    const root = this.inVaultCase(normalizePath(cleanRoot(this.options.folder)));
+    const uncategorized = this.inVaultCase(normalizePath(`${root}/${UNCATEGORIZED_FOLDER}`));
     const [from, to] = this.useUncategorized ? [root, uncategorized] : [uncategorized, root];
 
     for (const [key, tracked] of Object.entries(this.state.notes)) {
@@ -214,7 +226,8 @@ export class SyncEngine {
    *  `(3)`… when another note owns that name. An untracked file already at a
    *  candidate path is either this note's file from a lost or other-device
    *  plugin state, or something the user made: identical content is adopted,
-   *  anything else is left alone and reported rather than duplicated.
+   *  anything else is left alone and reported rather than duplicated. Names
+   *  that differ only in capitals count as the same name (see `findIgnoringCase`).
    */
   private async place(
     key: string,
@@ -226,7 +239,7 @@ export class SyncEngine {
   ): Promise<void> {
     for (let n = 1; n <= MAX_NAME_SUFFIX; n++) {
       const path = n === 1 ? desired : withNumberSuffix(desired, n);
-      const existing = this.app.vault.getAbstractFileByPath(path);
+      const existing = this.findIgnoringCase(path);
       if (!existing) {
         await this.ensureFolder(parentOf(path));
         await this.app.vault.create(path, content);
@@ -234,12 +247,12 @@ export class SyncEngine {
         result.created++;
         return;
       }
-      if (this.owners.has(path) || !(existing instanceof TFile)) continue;
+      if (this.owners.has(existing.path) || !(existing instanceof TFile)) continue;
       if ((await this.app.vault.read(existing)) === content) {
-        this.track(key, path, hash, path, unfiled);
+        this.track(key, existing.path, hash, existing.path, unfiled);
         return;
       }
-      result.skippedEdited.push(path);
+      result.skippedEdited.push(existing.path);
       return;
     }
     throw new Error(`Too many notes named "${desired}".`);
@@ -251,13 +264,48 @@ export class SyncEngine {
   private async renameTarget(desired: string, currentPath: string): Promise<string> {
     for (let n = 1; n <= MAX_NAME_SUFFIX; n++) {
       const path = n === 1 ? desired : withNumberSuffix(desired, n);
-      if (path === currentPath) return path;
-      if (!this.app.vault.getAbstractFileByPath(path)) {
+      const existing = this.findIgnoringCase(path);
+      // The file itself, even under new capitals, doesn't block its own name.
+      if (existing?.path === currentPath) return path;
+      if (!existing) {
         await this.ensureFolder(parentOf(path));
         return path;
       }
     }
     return currentPath;
+  }
+
+  /** The file or folder at `path`, matching names regardless of capitals.
+   *  Windows and macOS keep "Idea.md" and "idea.md" as one file, and
+   *  Obsidian refuses to create the second ("File already exists."), so
+   *  every "is this name free?" check goes through here, on every platform,
+   *  which also keeps a vault safe to open on another computer.
+   */
+  private findIgnoringCase(path: string): TAbstractFile | null {
+    const exact = this.app.vault.getAbstractFileByPath(path);
+    if (exact) return exact;
+    let found: TAbstractFile | null = this.app.vault.getRoot();
+    for (const segment of path.split("/")) {
+      found = found instanceof TFolder ? childIgnoringCase(found, segment) : null;
+      if (!found) return null;
+    }
+    return found;
+  }
+
+  /** `path` with each leading folder that already exists spelled the way the
+   *  vault has it, so notes for AudioPen folders "Ideas" and "ideas" share
+   *  one Obsidian folder instead of failing to create a second.
+   */
+  private inVaultCase(path: string): string {
+    const segments = path.split("/");
+    let folder = this.app.vault.getRoot();
+    for (let i = 0; i < segments.length; i++) {
+      const match = childIgnoringCase(folder, segments[i]);
+      if (!(match instanceof TFolder)) break;
+      segments[i] = match.name;
+      folder = match;
+    }
+    return segments.join("/");
   }
 
   private track(key: string, path: string, hash: string, autoPath: string, unfiled: boolean): void {
@@ -288,6 +336,11 @@ export class SyncEngine {
     const file = this.app.vault.getAbstractFileByPath(path);
     return file instanceof TFile ? file : null;
   }
+}
+
+function childIgnoringCase(folder: TFolder, name: string): TAbstractFile | null {
+  const wanted = name.toLowerCase();
+  return folder.children.find((child) => child.name.toLowerCase() === wanted) ?? null;
 }
 
 function parentOf(path: string): string {

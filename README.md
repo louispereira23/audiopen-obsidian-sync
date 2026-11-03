@@ -23,6 +23,8 @@ their own folder (you can rename it), or give AudioPen a vault of its own.
 - The title, dates, folder and tags are at the top as properties, followed by
   the note itself and the original transcript, folded away underneath.
 - Notes with the same title are named `Title.md`, `Title (2).md`, and so on.
+  Titles that differ only in capitals (`Idea` and `idea`) count as the same,
+  since Windows and macOS treat them as one file.
 - Notes without a folder sit directly in the `AudioPen` folder. Once you have
   at least one folder in AudioPen, they move into `AudioPen/Uncategorized`
   (and back again if you delete all your folders). Notes you've moved
